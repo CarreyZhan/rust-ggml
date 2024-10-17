@@ -22,12 +22,34 @@ pub struct Context {
 }
 
 macro_rules! safe_bindings_op {
-    ($name:ident, $ffi_fn:path $(, $arg:ident)*) => {
-        pub fn $name(&self, $($arg: &Tensor),*) -> Tensor {
+    ($name:ident, $ffi_fn:path $(, $arg:ident: $type:ty)*) => {
+        pub fn $name(&self, $($arg: $type),*) -> Tensor {
             Tensor {
-                tensor: unsafe { $ffi_fn(self.ctx, $($arg.tensor),*) },
+                tensor: unsafe { $ffi_fn(self.ctx, $($arg.into_ffi_param()),*) },
             }
         }
+    };
+    ($name:ident, $ffi_fn:path $(, $arg:ident)*) => {
+        safe_bindings_op!($name, $ffi_fn $(, $arg: &Tensor)*);
+    };
+}
+
+trait IntoFFIParam {
+    type FFIType;
+    fn into_ffi_param(&self) -> Self::FFIType;
+}
+
+impl IntoFFIParam for &Tensor {
+    type FFIType = *mut ffi_ggml::ggml_tensor;
+    fn into_ffi_param(&self) -> Self::FFIType {
+        self.tensor
+    }
+}
+
+impl IntoFFIParam for f32 {
+    type FFIType = f32;
+    fn into_ffi_param(&self) -> Self::FFIType {
+        *self
     }
 }
 
@@ -139,12 +161,6 @@ impl Context {
     safe_bindings_op!(cont, ffi_ggml::ggml_cont, a);
 
     // check done at GGML level
-    safe_bindings_op!(conv_1d_1s, ffi_ggml::ggml_conv_1d_1s, a, b);
-
-    // check done at GGML level
-    safe_bindings_op!(conv_1d_2s, ffi_ggml::ggml_conv_1d_2s, a, b);
-
-    // check done at GGML level
     safe_bindings_op!(sub, ffi_ggml::ggml_sub, a, b);
 
     // check done at GGML level
@@ -176,14 +192,14 @@ impl Context {
 
     safe_bindings_op!(silu, ffi_ggml::ggml_silu, a);
 
-    safe_bindings_op!(norm, ffi_ggml::ggml_norm, a);
+    safe_bindings_op!(norm, ffi_ggml::ggml_norm, a: &Tensor, eps: f32);
 
-    safe_bindings_op!(rms_norm, ffi_ggml::ggml_rms_norm, a);
+    safe_bindings_op!(rms_norm, ffi_ggml::ggml_rms_norm, a: &Tensor, eps: f32);
 
     // check done at GGML level
     safe_bindings_op!(mul_mat, ffi_ggml::ggml_mul_mat, a, b);
 
-    safe_bindings_op!(scale, ffi_ggml::ggml_scale, a, b);
+    safe_bindings_op!(scale, ffi_ggml::ggml_scale, a: &Tensor, b: f32);
 
     // check done at GGML level
     safe_bindings_op!(reshape, ffi_ggml::ggml_reshape, a, b);
@@ -359,13 +375,13 @@ impl Context {
         })
     }
 
-    pub fn rope(&self, a: &Tensor, n_past: usize, n_dims: usize, skip: bool) -> Result<Tensor, ()> {
+    pub fn rope(&self, a: &Tensor, b: &Tensor, n_dims: usize, skip: bool) -> Result<Tensor, ()> {
         Ok(Tensor {
             tensor: unsafe {
                 ffi_ggml::ggml_rope(
                     self.ctx,
                     a.tensor,
-                    n_past.try_into().unwrap(),
+                    b.tensor,
                     n_dims.try_into().unwrap(),
                     skip.try_into().unwrap(),
                 )
@@ -378,28 +394,11 @@ impl Context {
         query: &Tensor,
         key: &Tensor,
         value: &Tensor,
-        masked: bool,
+        masked: &Tensor,
     ) -> Result<Tensor, ()> {
         Ok(Tensor {
             tensor: unsafe {
-                ffi_ggml::ggml_flash_attn(self.ctx, query.tensor, key.tensor, value.tensor, masked)
-            },
-        })
-    }
-
-    pub fn flash_feed_forward(
-        &self,
-        a: &Tensor,
-        b0: &Tensor,
-        b1: &Tensor,
-        c0: &Tensor,
-        c1: &Tensor,
-    ) -> Result<Tensor, ()> {
-        Ok(Tensor {
-            tensor: unsafe {
-                ffi_ggml::ggml_flash_ff(
-                    self.ctx, a.tensor, b0.tensor, b1.tensor, c0.tensor, c1.tensor,
-                )
+                ffi_ggml::ggml_flash_attn_ext(self.ctx, query.tensor, key.tensor, value.tensor, masked.tensor, 1.0, 0.0, 0.0)
             },
         })
     }
@@ -415,37 +414,34 @@ impl Drop for Context {
 }
 
 pub struct CGraph {
-    graph: ffi_ggml::ggml_cgraph,
+    graph: *mut ffi_ggml::ggml_cgraph,
+    ctx: Context,
 }
 
 impl CGraph {
-    pub fn build_forward(tensor: &Tensor) -> Self {
-        Self {
-            graph: unsafe { ffi_ggml::ggml_build_forward(tensor.tensor) },
+
+    pub fn new(ctx: Context) -> Self {
+        CGraph {
+            graph: unsafe { ffi_ggml::ggml_new_graph(ctx.ctx) },
+            ctx: ctx,
         }
     }
 
-    pub fn build_backward(ctx: &Context, graph: &mut CGraph, keep: bool) -> Self {
-        Self {
-            graph: unsafe { ffi_ggml::ggml_build_backward(ctx.ctx, &mut graph.graph, keep) },
-        }
+    pub fn build_forward(&mut self, tensor: &Tensor) {
+        unsafe { ffi_ggml::ggml_build_forward_expand(self.graph, tensor.tensor) }
     }
 
-    pub fn build_forward_expand(&mut self, tensor: &Tensor) {
-        unsafe { ffi_ggml::ggml_build_forward_expand(&mut self.graph, tensor.tensor) }
-    }
-
-    pub fn compute(&mut self, ctx: &Context) {
-        unsafe { ffi_ggml::ggml_graph_compute(ctx.ctx, &mut self.graph) }
+    pub fn compute(&mut self) {
+        unsafe { ffi_ggml::ggml_graph_compute_with_ctx(self.ctx.ctx, self.graph, ffi_ggml::GGML_DEFAULT_N_THREADS as i32); }
     }
 
     pub fn reset(&mut self) {
-        unsafe { ffi_ggml::ggml_graph_reset(&mut self.graph) }
+        unsafe { ffi_ggml::ggml_graph_reset(self.graph) }
     }
 
     // TODO: implement display trait
     pub fn print(&self) {
-        unsafe { ffi_ggml::ggml_graph_print(&self.graph) }
+        unsafe { ffi_ggml::ggml_graph_print(std::mem::transmute::<*mut ffi_ggml::ggml_cgraph, *const ffi_ggml::ggml_cgraph>(self.graph)) }
     }
 }
 
